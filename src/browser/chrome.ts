@@ -43,6 +43,9 @@ import {
 
 const log = createSubsystemLogger("browser").child("chrome");
 
+/** Deduplicates concurrent launch attempts for the same profile. */
+const pendingLaunches = new Map<string, Promise<RunningChrome>>();
+
 export type { BrowserExecutable } from "./chrome.executables.js";
 export {
   findChromeExecutableLinux,
@@ -291,6 +294,16 @@ export async function isChromeCdpReady(
   return await canRunCdpHealthCommand(wsUrl, handshakeTimeoutMs);
 }
 
+/**
+ * Launch a Chrome instance for the given profile.
+ *
+ * Uses a pending-launch map to deduplicate concurrent calls for the same
+ * profile port.  When two callers race to start the browser, only the first
+ * actually spawns Chrome; subsequent callers wait for that promise and share
+ * the same result.  This prevents the `PortInUseError` that would otherwise
+ * arise when two `ensureBrowserAvailable()` calls both see the port as free
+ * before Chrome has had time to bind it.
+ */
 export async function launchOpenClawChrome(
   resolved: ResolvedBrowserConfig,
   profile: ResolvedBrowserProfile,
@@ -298,6 +311,31 @@ export async function launchOpenClawChrome(
   if (!profile.cdpIsLoopback) {
     throw new Error(`Profile "${profile.name}" is remote; cannot launch local Chrome.`);
   }
+
+  const cacheKey = `${profile.name}:${profile.cdpPort}`;
+  const existing = pendingLaunches.get(cacheKey);
+  if (existing) {
+    log.debug(`launchOpenClawChrome [${profile.name}] reusing in-flight launch`);
+    return await existing;
+  }
+
+  const launch = doLaunchOpenClawChrome(resolved, profile);
+  pendingLaunches.set(cacheKey, launch);
+  try {
+    return await launch;
+  } finally {
+    // Only evict if this is still the current entry (a newer call may have
+    // already replaced it with its own promise).
+    if (pendingLaunches.get(cacheKey) === launch) {
+      pendingLaunches.delete(cacheKey);
+    }
+  }
+}
+
+async function doLaunchOpenClawChrome(
+  resolved: ResolvedBrowserConfig,
+  profile: ResolvedBrowserProfile,
+): Promise<RunningChrome> {
   await ensurePortAvailable(profile.cdpPort);
 
   const exe = resolveBrowserExecutable(resolved);
@@ -331,7 +369,6 @@ export async function launchOpenClawChrome(
       stdio: ["ignore", "ignore", "pipe"],
       env: {
         ...process.env,
-        // Reduce accidental sharing with the user's env.
         HOME: os.homedir(),
       },
     }) as unknown as ChildProcessWithoutNullStreams;
@@ -343,8 +380,6 @@ export async function launchOpenClawChrome(
   const preferencesPath = path.join(userDataDir, "Default", "Preferences");
   const needsBootstrap = !exists(localStatePath) || !exists(preferencesPath);
 
-  // If the profile doesn't exist yet, bootstrap it once so Chrome creates defaults.
-  // Then decorate (if needed) before the "real" run.
   if (needsBootstrap) {
     const bootstrap = spawnOnce();
     const deadline = Date.now() + CHROME_BOOTSTRAP_PREFS_TIMEOUT_MS;
@@ -388,16 +423,12 @@ export async function launchOpenClawChrome(
 
   const proc = spawnOnce();
 
-  // Collect stderr for diagnostics in case Chrome fails to start.
-  // The listener is removed on success to avoid unbounded memory growth
-  // from a long-lived Chrome process that emits periodic warnings.
   const stderrChunks: Buffer[] = [];
   const onStderr = (chunk: Buffer) => {
     stderrChunks.push(chunk);
   };
   proc.stderr?.on("data", onStderr);
 
-  // Wait for CDP to come up.
   const readyDeadline = Date.now() + CHROME_LAUNCH_READY_WINDOW_MS;
   while (Date.now() < readyDeadline) {
     if (await isChromeReachable(profile.cdpUrl)) {
@@ -425,7 +456,6 @@ export async function launchOpenClawChrome(
     );
   }
 
-  // Chrome started successfully — detach the stderr listener and release the buffer.
   proc.stderr?.off("data", onStderr);
   stderrChunks.length = 0;
 

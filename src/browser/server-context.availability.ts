@@ -47,6 +47,9 @@ type AvailabilityOps = {
   stopRunningBrowser: () => Promise<{ stopped: boolean }>;
 };
 
+/** Deduplicates concurrent ensureBrowserAvailable calls per profile. */
+const pendingEnsures = new Map<string, Promise<void>>();
+
 export function createProfileAvailability({
   opts,
   profile,
@@ -173,6 +176,28 @@ export function createProfileAvailability({
   };
 
   const ensureBrowserAvailable = async (): Promise<void> => {
+    // Deduplicate concurrent callers so that only the first launch attempt wins.
+    // This prevents race conditions where two callers both see `httpReachable = false`
+    // and both try to launch Chrome, causing `ensurePortAvailable` to throw
+    // `PortInUseError` on the second call.
+    const cacheKey = profile.name;
+    const existing = pendingEnsures.get(cacheKey);
+    if (existing) {
+      await existing;
+      return;
+    }
+    const p = doEnsureBrowserAvailable();
+    pendingEnsures.set(cacheKey, p);
+    try {
+      await p;
+    } finally {
+      if (pendingEnsures.get(cacheKey) === p) {
+        pendingEnsures.delete(cacheKey);
+      }
+    }
+  };
+
+  const doEnsureBrowserAvailable = async (): Promise<void> => {
     await reconcileProfileRuntime();
     if (capabilities.usesChromeMcp) {
       if (profile.userDataDir && !fs.existsSync(profile.userDataDir)) {
